@@ -1,0 +1,180 @@
+version: '3.8'
+
+services:
+  # MySQL Database
+  mysql:
+    image: mysql:8.0
+    container_name: texworkforce-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_DATABASE: texworkforce
+      MYSQL_USER: texworkforce
+      MYSQL_PASSWORD: texworkforce
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - texworkforce-network
+
+  # MQTT Broker (Eclipse Mosquitto)
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: texworkforce-mqtt
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mosquitto/config/mosquitto.conf:/mosquitto/config/mosquitto.conf
+      - ./mosquitto/data:/mosquitto/data
+      - ./mosquitto/log:/mosquitto/log
+    networks:
+      - texworkforce-network
+
+  # Redis for Celery/Caching
+  redis:
+    image: redis:7-alpine
+    container_name: texworkforce-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - texworkforce-network
+
+  # Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: texworkforce-backend
+    environment:
+      - FLASK_ENV=development
+      - DATABASE_URL=mysql+pymysql://texworkforce:texworkforce@mysql:3306/texworkforce
+      - MQTT_BROKER_HOST=mosquitto
+      - MQTT_BROKER_PORT=1883
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - JWT_SECRET_KEY=your-super-secret-jwt-key-change-in-production
+      - SECRET_KEY=your-secret-key-change-in-production
+      - FRONTEND_URL=http://localhost:5173
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./backend:/app
+      - /app/venv
+    depends_on:
+      mysql:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    networks:
+      - texworkforce-network
+    command: >
+      sh -c "pip install -r requirements.txt &&
+             flask db upgrade &&
+             python run.py"
+
+  # Celery Worker
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: texworkforce-celery
+    environment:
+      - FLASK_ENV=development
+      - DATABASE_URL=mysql+pymysql://texworkforce:texworkforce@mysql:3306/texworkforce
+      - MQTT_BROKER_HOST=mosquitto
+      - MQTT_BROKER_PORT=1883
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    volumes:
+      - ./backend:/app
+      - /app/venv
+    depends_on:
+      - redis
+      - mysql
+    networks:
+      - texworkforce-network
+    command: celery -A app.celery worker --loglevel=info
+
+  # Celery Beat (Scheduler)
+  celery-beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: texworkforce-celery-beat
+    environment:
+      - FLASK_ENV=development
+      - DATABASE_URL=mysql+pymysql://texworkforce:texworkforce@mysql:3306/texworkforce
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    volumes:
+      - ./backend:/app
+      - /app/venv
+    depends_on:
+      - redis
+      - mysql
+    networks:
+      - texworkforce-network
+    command: celery -A app.celery beat --loglevel=info
+
+  # Frontend Development Server
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: texworkforce-frontend
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      - VITE_API_URL=http://localhost:5000/api
+      - VITE_WS_URL=http://localhost:5000
+    depends_on:
+      - backend
+    networks:
+      - texworkforce-network
+    command: npm run dev -- --host 0.0.0.0
+
+  # IoT Simulator (for testing)
+  iot-simulator:
+    build:
+      context: ./iot-simulator
+      dockerfile: Dockerfile
+    container_name: texworkforce-iot-simulator
+    environment:
+      - MQTT_BROKER_HOST=mosquitto
+      - MQTT_BROKER_PORT=1883
+      - SIMULATION_INTERVAL=5
+    volumes:
+      - ./iot-simulator:/app
+    depends_on:
+      - mosquitto
+    networks:
+      - texworkforce-network
+    profiles:
+      - testing
+
+networks:
+  texworkforce-network:
+    driver: bridge
+
+volumes:
+  mysql_data:
+  redis_data:
